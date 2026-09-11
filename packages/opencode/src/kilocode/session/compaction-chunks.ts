@@ -2,6 +2,7 @@ import { Effect } from "effect"
 import type { Agent } from "@/agent/agent"
 import type { Config } from "@/config/config"
 import type { Provider } from "@/provider/provider"
+import { ProviderTransform } from "@/provider/transform"
 import type { LLM } from "@/session/llm"
 import { MessageV2 } from "@/session/message-v2"
 import { usable } from "@/session/overflow"
@@ -10,6 +11,7 @@ import { MessageID, PartID, type SessionID } from "@/session/schema"
 import type { Session } from "@/session/session"
 import { Token } from "@/util/token"
 import * as Log from "@opencode-ai/core/util/log"
+import { Database } from "@opencode-ai/core/database/database"
 
 type Update = <T extends MessageV2.Part>(part: T) => Effect.Effect<T>
 type UpdateMessage = <T extends MessageV2.Info>(msg: T) => Effect.Effect<T>
@@ -31,6 +33,7 @@ export namespace KiloCompactionChunks {
   type Output = {
     result: SessionProcessor.Result
     output: string | undefined
+    error: MessageV2.Assistant["error"]
   }
 
   type Deps = {
@@ -47,6 +50,7 @@ export namespace KiloCompactionChunks {
     messages: MessageV2.WithParts[]
     prompt: string
     target: MessageV2.Assistant
+    outputTokenMax?: number
     updateMessage: UpdateMessage
     updatePart: Update
   }
@@ -61,10 +65,14 @@ export namespace KiloCompactionChunks {
     return input.result === "stop" && input.error?.name === "ContextOverflowError"
   }
 
-  export function needed(input: { cfg: Config.Info; model: Provider.Model; tokens: number }) {
+  export function needed(input: { cfg: Config.Info; model: Provider.Model; tokens: number; outputTokenMax?: number }) {
+    const mdl = model(input.model, input.outputTokenMax)
     // Apply 1.3x multiplier to token estimate to compensate for Token.estimate
     // under-counting actual provider tokenizer counts by ~15-30%.
-    return Math.ceil(input.tokens * 1.3) + model(input.model).limit.output > usable({ cfg: input.cfg, model: model(input.model) })
+    return (
+      Math.ceil(input.tokens * 1.3) + mdl.limit.output >
+      usable({ cfg: input.cfg, model: mdl, outputTokenMax: input.outputTokenMax })
+    )
   }
 
   export function replay(input: Input & { replay: Replay }) {
@@ -73,7 +81,7 @@ export namespace KiloCompactionChunks {
         index: 0,
         messages: [{ info: input.replay.info, parts: input.replay.parts }],
       }
-      const size = budget({ cfg: input.cfg, model: input.model })
+      const size = budget({ cfg: input.cfg, model: input.model, outputTokenMax: input.outputTokenMax })
       if (!(yield* large({ messages: chunk.messages, model: input.model, size }))) return input.replay
       const result = yield* summarize({ ...input, chunk, total: 1 })
       if (result.result !== "continue" || !result.output) return input.replay
@@ -97,16 +105,21 @@ export namespace KiloCompactionChunks {
     })
   }
 
-  function budget(input: { cfg: Config.Info; model: Provider.Model }) {
-    return Math.max(1_000, Math.floor(usable({ cfg: input.cfg, model: model(input.model) }) * RATIO))
+  export function budget(input: { cfg: Config.Info; model: Provider.Model; outputTokenMax?: number }) {
+    const mdl = model(input.model, input.outputTokenMax)
+    return Math.max(
+      1_000,
+      Math.floor(usable({ cfg: input.cfg, model: mdl, outputTokenMax: input.outputTokenMax }) * RATIO),
+    )
   }
 
-  function model(input: Provider.Model) {
+  function model(input: Provider.Model, outputTokenMax?: number) {
+    const cap = Math.min(OUTPUT, outputTokenMax ?? OUTPUT)
     return {
       ...input,
       limit: {
         ...input.limit,
-        output: Math.min(input.limit.output, OUTPUT),
+        output: ProviderTransform.maxOutputTokens(input, cap),
       },
     } satisfies Provider.Model
   }
@@ -161,10 +174,12 @@ export namespace KiloCompactionChunks {
 
   function part(part: MessageV2.Part) {
     if (part.type === "text") return clip({ text: part.text, chars: TRANSCRIPT_MAX_CHARS, label: "Text" })
-    if (part.type === "reasoning") return `[Reasoning]: ${clip({ text: part.text, chars: TRANSCRIPT_MAX_CHARS, label: "Reasoning" })}`
+    if (part.type === "reasoning")
+      return `[Reasoning]: ${clip({ text: part.text, chars: TRANSCRIPT_MAX_CHARS, label: "Reasoning" })}`
     if (part.type === "file") return `[File attachment]: ${part.filename ?? part.url} (${part.mime})`
     if (part.type === "agent") return `[Agent]: ${part.name}`
-    if (part.type === "subtask") return `[Subtask ${part.agent}]: ${part.description}\n${clip({ text: part.prompt, chars: TRANSCRIPT_MAX_CHARS, label: "Subtask prompt" })}`
+    if (part.type === "subtask")
+      return `[Subtask ${part.agent}]: ${part.description}\n${clip({ text: part.prompt, chars: TRANSCRIPT_MAX_CHARS, label: "Subtask prompt" })}`
     if (part.type === "tool") {
       const head = `[Tool ${part.tool} ${part.state.status}]`
       if (part.state.status === "completed") {
@@ -174,7 +189,8 @@ export namespace KiloCompactionChunks {
           `output: ${clip({ text: part.state.output, chars: TOOL_OUTPUT_MAX_CHARS, label: "Tool output" })}`,
         ].join("\n")
       }
-      if (part.state.status === "error") return `${head}\n${clip({ text: part.state.error, chars: TOOL_OUTPUT_MAX_CHARS, label: "Tool error" })}`
+      if (part.state.status === "error")
+        return `${head}\n${clip({ text: part.state.error, chars: TOOL_OUTPUT_MAX_CHARS, label: "Tool error" })}`
       return `${head}\ninput: ${clip({ text: JSON.stringify(part.state.input), chars: TOOL_OUTPUT_MAX_CHARS, label: "Tool input" })}`
     }
     if (part.type === "step-finish") return `[Step finished]: ${part.reason}`
@@ -185,11 +201,12 @@ export namespace KiloCompactionChunks {
   function transcript(input: { messages: MessageV2.WithParts[] }) {
     return input.messages
       .map((msg, index) => {
-        const body = msg.parts
-          .map(part)
-          .filter(Boolean)
-          .join("\n\n")
-        return [`<message index=\"${index + 1}\" role=\"${msg.info.role}\">`, body || "[no content]", "</message>"].join("\n")
+        const body = msg.parts.map(part).filter(Boolean).join("\n\n")
+        return [
+          `<message index=\"${index + 1}\" role=\"${msg.info.role}\">`,
+          body || "[no content]",
+          "</message>",
+        ].join("\n")
       })
       .join("\n\n")
   }
@@ -232,19 +249,13 @@ export namespace KiloCompactionChunks {
   function run(input: Input & { data: LLM.StreamInput["messages"]; text: string }) {
     return Effect.gen(function* () {
       const msg = yield* input.session.updateMessage(assistant({ base: input.target, sessionID: input.sessionID }))
-      const mdl = model(input.model)
+      const mdl = model(input.model, input.outputTokenMax)
       const worker = yield* input.processors.create({ assistantMessage: msg, sessionID: input.sessionID, model: mdl })
       const opts = input.agent.options
-      const agent = {
-        ...input.agent,
-        options: {
-          ...opts,
-          maxOutputTokens: Math.min(
-            OUTPUT,
-            typeof opts?.maxOutputTokens === "number" ? opts.maxOutputTokens : OUTPUT,
-          ),
-        },
-      }
+      // agent.options feeds into providerOptions; strip maxOutputTokens
+      // so it does not leak into the wire body. The output cap is enforced
+      // independently via the constrained model and llm.ts re-cap.
+      const agent = { ...input.agent, options: opts ?? {} }
       const out = yield* Effect.gen(function* () {
         const result = yield* worker.process({
           user: input.user,
@@ -255,8 +266,12 @@ export namespace KiloCompactionChunks {
           messages: [...input.data, { role: "user", content: [{ type: "text", text: input.text }] }],
           model: mdl,
         })
-        const parts = MessageV2.parts(worker.message.id)
-        return { result, output: text(worker.message, parts) }
+        const parts = yield* MessageV2.parts(worker.message.id)
+        return {
+          result,
+          output: text(worker.message, parts),
+          error: worker.message.error ?? worker.compactError?.(),
+        }
       }).pipe(
         Effect.ensuring(
           input.session.removeMessage({ sessionID: input.sessionID, messageID: worker.message.id }).pipe(Effect.ignore),
@@ -264,15 +279,43 @@ export namespace KiloCompactionChunks {
       )
       const result = out.result
       const output = out.output
-      if (result !== "continue") return { result, output: undefined }
-      if (!output) return { result: "stop" as const, output: undefined }
-      return { result, output }
+      if (result !== "continue") return { result, output: undefined, error: out.error }
+      if (!output)
+        return {
+          result: "stop" as const,
+          output: undefined,
+          error:
+            out.error ??
+            new MessageV2.APIError({
+              message: "Compaction worker returned an empty response",
+              isRetryable: true,
+            }).toObject(),
+        }
+      return { result, output, error: undefined }
+    })
+  }
+
+  function fatal(output: Output | undefined) {
+    return output?.result === "stop" && !!output.error && output.error.name !== "ContextOverflowError"
+  }
+
+  function fail(input: Input, output: Output | undefined) {
+    return Effect.gen(function* () {
+      if (output?.result !== "stop") return false
+      const error = output.error
+      if (!error || error.name === "ContextOverflowError") return false
+
+      input.target.error = error
+      input.target.finish = "error"
+      input.target.time.completed = Date.now()
+      yield* input.updateMessage(input.target)
+      return true
     })
   }
 
   function summarize(input: Input & { chunk: Chunk; total: number }) {
     return Effect.gen(function* () {
-      const size = budget({ cfg: input.cfg, model: input.model })
+      const size = budget({ cfg: input.cfg, model: input.model, outputTokenMax: input.outputTokenMax })
       const data = (yield* large({ messages: input.chunk.messages, model: input.model, size }))
         ? [
             {
@@ -299,7 +342,9 @@ export namespace KiloCompactionChunks {
     })
   }
 
-  function reduce(input: Input & { summaries: string[]; depth: number }): Effect.Effect<Output> {
+  function reduce(
+    input: Input & { summaries: string[]; depth: number },
+  ): Effect.Effect<Output, never, Database.Service> {
     return Effect.gen(function* () {
       const result = yield* run({ ...input, data: messages({ summaries: input.summaries }), text: input.prompt })
       if (result.result === "continue") return result
@@ -314,28 +359,35 @@ export namespace KiloCompactionChunks {
         (group) => reduce({ ...input, summaries: group, depth: input.depth + 1 }),
         { concurrency: 1 },
       )
-      if (next.some((item) => item.result !== "continue" || !item.output)) return result
+      const failed = next.find(fatal) ?? next.find((item) => item.result !== "continue" || !item.output)
+      if (failed) return fatal(failed) ? failed : result
       return yield* reduce({ ...input, summaries: next.map((item) => item.output!), depth: input.depth + 2 })
     })
   }
 
   export function process(input: Input) {
     return Effect.gen(function* () {
-      const size = budget({ cfg: input.cfg, model: input.model })
+      const size = budget({ cfg: input.cfg, model: input.model, outputTokenMax: input.outputTokenMax })
       const chunks = yield* split({ messages: input.messages, model: input.model, size })
       log.info("fallback", { chunks: chunks.length, concurrency: CONCURRENCY })
 
-      const partial = yield* Effect.forEach(
-        chunks,
-        (chunk) => summarize({ ...input, chunk, total: chunks.length }),
-        { concurrency: Math.min(CONCURRENCY, chunks.length) },
-      )
-      if (partial.some((item) => item.result !== "continue" || !item.output)) return "compact" as const
+      const partial = yield* Effect.forEach(chunks, (chunk) => summarize({ ...input, chunk, total: chunks.length }), {
+        concurrency: Math.min(CONCURRENCY, chunks.length),
+      })
+      const failed = partial.find(fatal) ?? partial.find((item) => item.result !== "continue" || !item.output)
+      if (failed) {
+        if (yield* fail(input, failed)) return "stop" as const
+        return "compact" as const
+      }
 
-      const final = chunks.length === 1 && (yield* large({ messages: chunks[0].messages, model: input.model, size }))
-        ? partial[0]
-        : yield* reduce({ ...input, summaries: partial.map((item) => item.output!), depth: 0 })
-      if (!final || final.result !== "continue" || !final.output) return "compact" as const
+      const final =
+        chunks.length === 1 && (yield* large({ messages: chunks[0].messages, model: input.model, size }))
+          ? partial[0]
+          : yield* reduce({ ...input, summaries: partial.map((item) => item.output!), depth: 0 })
+      if (!final || final.result !== "continue" || !final.output) {
+        if (yield* fail(input, final)) return "stop" as const
+        return "compact" as const
+      }
 
       yield* input.updatePart({
         id: PartID.ascending(),
